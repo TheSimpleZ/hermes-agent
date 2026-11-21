@@ -81,10 +81,12 @@ def maybe_grow_window(model_id: str, *, base_url: str, session_tokens: int,
 
     sup = get_supervisor()
     if sup is None or not is_managed_endpoint(base_url):
+        logger.debug("growth %s: skipped (no supervisor or not the managed endpoint)", model_id)
         return None
 
     gguf = next((p for p in staged_models() if model_id_from_stem(p.stem) == model_id), None)
     if gguf is None:
+        logger.debug("growth %s: skipped (no staged GGUF for this model id)", model_id)
         return None
 
     try:

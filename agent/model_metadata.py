@@ -420,8 +420,12 @@ def is_anthropic_fast_mode_model(model: Optional[str]) -> bool:
     return re.sub(r"-\d{8}$", "", name) in _ANTHROPIC_FAST_MODE_MODELS
 
 
+# "n_ctx_train" is deliberately absent: on llama.cpp it is the GGUF *training* max, not the
+# runtime window the server actually allocated — accepting it overstates the context and pushes
+# the compressor threshold above the real window (silent truncation). Runtime "n_ctx" / "ctx_size"
+# are the allocated values.
 _CONTEXT_LENGTH_KEYS = ("context_length", "context_window", "context_size", "max_context_length", "max_position_embeddings",
-    "max_model_len", "max_input_tokens", "max_sequence_length", "max_seq_len", "n_ctx_train", "n_ctx", "ctx_size")
+    "max_model_len", "max_input_tokens", "max_sequence_length", "max_seq_len", "n_ctx", "ctx_size")
 # Hosts whose plain /models omits every window but publishes it on request (NanoGPT: ?detailed=true).
 _MODELS_QUERY_BY_HOST = {"nano-gpt.com": {"detailed": "true"}}
 _MAX_COMPLETION_KEYS = ("max_completion_tokens", "max_output_tokens", "max_tokens")
@@ -1004,7 +1008,14 @@ def _apply_llamacpp_props(cache: dict[str, dict[str, Any]], request_candidate: s
         return
     for child in (native.json() or {}).get("data", [])[:16]:
         child_id = child.get("id") if isinstance(child, dict) else None
-        if not child_id or child_id not in cache or (child.get("status") or {}).get("value") not in ("loaded", "ready"):
+        if not child_id or child_id not in cache:
+            continue
+        if (child.get("status") or {}).get("value") not in ("loaded", "ready"):
+            # Unloaded: the parsed entry may still carry the GGUF training max (n_ctx_train),
+            # a confidently-wrong window that can exceed what the server will allocate. Drop it
+            # so resolution falls through to the planned window / unknown instead of a stale
+            # training max.
+            cache[child_id].pop("context_length", None)
             continue
         pr = _props({"model": child_id, "autoload": "false"})  # it may have unloaded since /models
         child_ctx = _n_ctx(pr.json()) if not pr.is_error else None
@@ -2205,6 +2216,36 @@ def _resolve_provider_aware_context_length(model: str, base_url: str, api_key: s
     return None
 
 
+def _planned_local_runtime_window(model: str, base_url: str) -> Optional[int]:
+    """Window the gateway's managed llama.cpp runtime was planned for ``model``, read from the
+    preset INI — the record of what actually spawned the router children. Valid while the model
+    is UNLOADED, when every live probe is blind (/models shows at best the GGUF training max)
+    and the endpoint/persistent caches may hold a stale value from a previous launch. Both are
+    confidently wrong for the compressor. None when the endpoint is not this machine's managed
+    runtime, no preset was recorded, or anything fails — the regular resolution chain then
+    proceeds as before."""
+    if not base_url or not _is_local_server(base_url, ""):
+        return None
+    try:
+        from hermes_cli.local_runtime.growth import is_managed_endpoint
+        from hermes_cli.local_runtime.presets import read_preset_decisions
+    except Exception:
+        return None
+    if not is_managed_endpoint(base_url):
+        return None
+    model_id = _strip_provider_prefix(model).strip().lower()
+    if not model_id:
+        return None
+    try:
+        entries = read_preset_decisions()
+    except Exception:
+        return None
+    for entry in entries.values():
+        if entry.window > 0 and entry.model_id.strip().lower() == model_id:
+            return entry.window
+    return None
+
+
 @records_context_defaults
 def get_model_context_length(
     model: str, base_url: str = "", api_key: str = "", config_context_length: int | None = None,
@@ -2224,6 +2265,12 @@ def get_model_context_length(
         if ctx is not None:
             return ctx
     ctx = _config_override_context_length(model, base_url, provider, custom_providers)
+    if ctx is not None:
+        return ctx
+    # 0d. Planned window of the gateway-managed local runtime. Wins over the endpoint-scoped
+    # and persistent caches (which can hold a stale/training-max value from a previous launch)
+    # while the model is unloaded; explicit config overrides above still win over the plan.
+    ctx = _planned_local_runtime_window(model, base_url)
     if ctx is not None:
         return ctx
     # Malformed URLs (unmatched IPv6 bracket) make urllib.parse raise; treat them as unknown so
