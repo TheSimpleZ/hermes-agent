@@ -1,0 +1,84 @@
+# Keeps this fork's main branch tracking the latest official Hermes stable
+# release, with the local fix commits on top.
+#
+# The desktop app's built-in update mechanism (channel "main" for fork
+# installs) pulls origin/main — so after a successful run here, the app's
+# normal Update button delivers "latest upstream release + local fixes"
+# without any local build.
+#
+# Failure policy: if merging a release conflicts, the run fails and opens
+# (one) issue titled "Fork sync failed" so it is visible on the phone.
+# Resolve locally (git pull upstream <tag>, fix, push origin local:main).
+
+name: Fork sync (upstream releases)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch upstream tags
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --tags --quiet upstream
+
+      - name: Find latest stable release
+        id: latest
+        run: |
+          latest=$(git tag --sort=-v:refname --list 'v*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+          if [ -z "${latest}" ]; then
+            echo "::error::No stable release tag found on upstream."
+            exit 1
+          fi
+          echo "tag=${latest}" >> "$GITHUB_OUTPUT"
+          echo "Latest stable release: ${latest}"
+
+      - name: Merge upstream release into main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          tag="${{ steps.latest.outputs.tag }}"
+          if git merge-base --is-ancestor "$tag" main; then
+            echo "main already contains ${tag} — nothing to do."
+            exit 0
+          fi
+          git config user.name "TheSimpleZ fork-sync"
+          git config user.email "fork-sync@users.noreply.github.com"
+          echo "Merging ${tag} into main..."
+          if ! git merge --no-ff "$tag" -m "Sync upstream ${tag} into local fork"; then
+            echo "::error::Merge conflict merging ${tag} into main. Resolve locally and push."
+            git merge --abort || true
+            if ! gh issue list --state open --search "in:title:\"Fork sync failed\" type:issue" --json number --jq 'length' | grep -q '^0$'; then
+              gh issue create \
+                --title "Fork sync failed: merge conflict on ${tag}" \
+                --body "The scheduled fork-sync could not merge upstream release \`${tag}\` into main (conflict). Resolve in the local clone: \`git fetch upstream --tags && git merge ${tag}\`, fix conflicts, then \`git push origin local:main\`. This issue stays open until the next successful sync closes it."
+            fi
+            exit 1
+          fi
+          git push origin main
+          echo "Pushed main with ${tag} merged."
+
+      - name: Close sync-failure issue on success
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue list --state open --search "in:title:\"Fork sync failed\" type:issue" --json number | \
+            jq -r '.[].number' | while read -r n; do
+              gh issue close "$n" --comment "Closed: latest sync run succeeded." || true
+            done || true
