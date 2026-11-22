@@ -12,8 +12,11 @@ rejects a level fix its declared set, never a predicate.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 #: Matches ``k3`` as a delimited token (``k3``, ``k3-256k``, ``kimi-k3-cot``), never K2-era names (``kimi-k2.6``).
 # From #76427 by @ruizanthony.
@@ -173,6 +176,14 @@ def route_supported_efforts(
         return (*supported, "ultra") if api_mode == "codex_app_server" and "max" in supported else supported
     from hermes_cli.local_runtime.capabilities import managed_reasoning_efforts
     local = managed_reasoning_efforts(provider or "", base_url or "", model or "")
+    if not local:
+        # Fallback to the widest wire vocabulary: the request's raw effort (``max``, ``ultra``)
+        # goes out unclamped. Logged because a transient managed-endpoint check failure takes
+        # this path and 500s local chat templates with no other trace.
+        logger.debug(
+            "reasoning-effort route: no managed local efforts for model=%r base_url=%r "
+            "provider=%r; falling back to OpenAI-compatible wire vocabulary",
+            model, base_url, provider)
     # llama-server turns thinking off for ``none`` itself, so a chat template never sees that level.
     return ("none", *local) if local else OPENAI_COMPAT_WIRE_EFFORTS
 

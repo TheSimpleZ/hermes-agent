@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import time
 from pathlib import Path
 
 import psutil
@@ -57,23 +58,36 @@ def recorded_process(state: dict):
                 or not _valid_pid(owner_pid) or not _valid_birth(owner_created)
                 or owner_created > created or not isinstance(exe, str) or not exe):
             return None
-        proc = psutil.Process(pid)
-        if (not proc.is_running() or not _same_birth(proc, state)
-                or Path(proc.exe()) != Path(exe)):
-            return None
-        # Windows retains the original parent PID; POSIX reparents orphans.
-        if os.name == "nt" and proc.ppid() != owner_pid:
-            return None
-        parent = proc.parent()
-        if parent is not None:
-            if parent.pid == owner_pid:
-                if not _same_birth(parent, state, "owner_"):
-                    return None
-            elif os.name == "nt" or not _owner_is_dead(state):
-                return None  # POSIX may reparent a router whose recorded owner exited.
-        return proc
-    except (KeyError, TypeError, ValueError, OverflowError, OSError, psutil.Error):
+    except (KeyError, TypeError, ValueError, OverflowError):
         return None
+    # A transient OS lookup error (handle-table pressure, a process mid-exit) must not read as
+    # "not managed": that fallback silently disables the effort clamp and 500s local chat
+    # templates. Retry once, then log the fallback instead of failing silently.
+    for attempt in (1, 2):
+        try:
+            proc = psutil.Process(pid)
+            if (not proc.is_running() or not _same_birth(proc, state)
+                    or Path(proc.exe()) != Path(exe)):
+                return None
+            # Windows retains the original parent PID; POSIX reparents orphans.
+            if os.name == "nt" and proc.ppid() != owner_pid:
+                return None
+            parent = proc.parent()
+            if parent is not None:
+                if parent.pid == owner_pid:
+                    if not _same_birth(parent, state, "owner_"):
+                        return None
+                elif os.name == "nt" or not _owner_is_dead(state):
+                    return None  # POSIX may reparent a router whose recorded owner exited.
+            return proc
+        except (OSError, psutil.Error) as exc:
+            if attempt == 1:
+                time.sleep(0.1)
+                continue
+            logger.warning(
+                "managed runtime process check failed after retry (pid %s): %s; "
+                "route falls back to unmanaged", pid, exc)
+            return None
 
 
 def _owner_is_dead(state: dict) -> bool:
